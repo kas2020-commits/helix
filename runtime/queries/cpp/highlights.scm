@@ -30,6 +30,33 @@
 (reference_declarator ["&" "&&"] @type.builtin)
 (abstract_reference_declarator ["&" "&&"] @type.builtin)
 
+; `Type<Arg> name` used as a call/macro argument (e.g. absl's
+; `ASSIGN_OR_RETURN(StatusOr<Foo> foo, MakeFoo())`) has no declaration form to
+; parse into, so it comes out as `(Type < Arg) > name`, a chain of two
+; binary_expressions, with no distinct node type marking Type/Arg as a type.
+; Recognize that shape structurally and highlight it the way the equivalent
+; standalone declaration would be. This is a heuristic: a real three-term
+; relational chain (rare as a bare call argument) would be mis-highlighted
+; the same way.
+(argument_list
+  (binary_expression
+    left: (binary_expression
+      left: [
+        (identifier) @type
+        (qualified_identifier name: (identifier) @type)
+        (template_function name: (identifier) @type)
+        (qualified_identifier name: (template_function name: (identifier) @type))
+      ]
+      operator: "<"
+      right: [
+        (identifier) @type
+        (qualified_identifier name: (identifier) @type)
+        (template_function name: (identifier) @type)
+        (qualified_identifier name: (template_function name: (identifier) @type))
+      ])
+    operator: ">"
+    right: (identifier) @variable))
+
 ; -------
 ; Functions
 ; -------
