@@ -7,7 +7,8 @@ use helix_event::TaskController;
 use helix_view::document::Mode;
 use helix_view::input::KeyEvent;
 use helix_view::keyboard::KeyCode;
-use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 use std::time::Duration;
 use std::{borrow::Cow, ops::RangeFrom};
@@ -62,6 +63,16 @@ pub struct Prompt {
     /// results are never delivered: a pending background task can only fill the receiver
     /// that was created alongside it.
     deferred_completion: Option<Receiver<Vec<Completion>>>,
+    /// The id of the deferred completion task currently in flight, if any.
+    ///
+    /// At most one background task runs per prompt: cancellation cannot interrupt a task
+    /// stuck in a blocking syscall, so instead of stacking up a new thread per keystroke,
+    /// recalculations that arrive while a task is in flight only set
+    /// [Self::pending_recalculation] and run once the task finishes.
+    deferred_task: Option<usize>,
+    /// Whether the line changed while a deferred completion task was in flight, requiring
+    /// a new recalculation once it finishes.
+    pending_recalculation: bool,
     callback_fn: CallbackFn,
     pub doc_fn: DocFn,
     next_char_handler: Option<PromptCharHandler>,
@@ -120,6 +131,8 @@ impl Prompt {
             completion_fn: Box::new(completion_fn),
             task_controller: TaskController::new(),
             deferred_completion: None,
+            deferred_task: None,
+            pending_recalculation: false,
             callback_fn: Box::new(callback_fn),
             doc_fn: Box::new(|_| None),
             next_char_handler: None,
@@ -183,26 +196,46 @@ impl Prompt {
         self.deferred_completion = None;
 
         self.exit_selection();
+
+        // we limit ourselves to 1 deferred task at a time. In case a deferred task
+        // is still running, indicate the desire to recalculate, then return early.
+        if self.deferred_task.is_some() {
+            self.pending_recalculation = true;
+            self.completion.clear();
+            return;
+        }
+        self.pending_recalculation = false;
+
         match (self.completion_fn)(editor, &self.line) {
             CompletionResult::Immediate(completion) => self.completion = completion,
             CompletionResult::Deferred(compute) => {
+                // Make deferred tasks globally unique within a prompt.
+                static NEXT_TASK_ID: AtomicUsize = AtomicUsize::new(0);
+                let task = NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed);
+                self.deferred_task = Some(task);
+
                 let (tx, rx) = std::sync::mpsc::sync_channel(1);
                 tokio::task::spawn_blocking(move || {
                     let completion = compute(&handle);
-                    if handle.is_canceled() || tx.send(completion).is_err() {
-                        return;
+                    if !handle.is_canceled() {
+                        let _ = tx.send(completion);
                     }
-                    job::dispatch_blocking(|_editor, compositor| {
+                    // we always notify the prompt of completion, even on cancellation,
+                    // in case we need to enque a new task. This keeps concurrency<=1.
+                    job::dispatch_blocking(move |editor, compositor| {
                         if let Some(prompt) = compositor.find::<Prompt>() {
-                            prompt.handle_deferred_completion();
+                            prompt.handle_deferred_completion(task, editor);
                         }
                     });
                 });
-                // Give fast completions a chance to finish synchronously so the completion
-                // menu doesn't flicker. If the deadline is missed the results are delivered
-                // through the job queue instead, which triggers the dispatch above.
+
+                // Avoid prompt flickering by eagerly waiting on fast deferred tasks.
                 match rx.recv_timeout(DEFERRED_COMPLETION_TIMEOUT) {
-                    Ok(completion) => self.completion = completion,
+                    Ok(completion) => {
+                        // ensure the callback handler returns early
+                        self.deferred_task = None;
+                        self.completion = completion;
+                    }
                     Err(_) => {
                         self.completion.clear();
                         self.deferred_completion = Some(rx);
@@ -212,19 +245,21 @@ impl Prompt {
         }
     }
 
-    fn handle_deferred_completion(&mut self) {
-        let Some(rx) = &self.deferred_completion else {
+    fn handle_deferred_completion(&mut self, task: usize, editor: &Editor) {
+        // Defend against already-consumed or cancelled completions
+        if self.deferred_task != Some(task) {
             return;
-        };
-        match rx.try_recv() {
-            Ok(completion) => {
-                self.deferred_completion = None;
+        }
+        self.deferred_task = None;
+        if self.pending_recalculation {
+            // completion has been rendered stale in the time it took to execute.
+            self.recalculate_completion(editor);
+            helix_event::request_redraw();
+        } else if let Some(rx) = self.deferred_completion.take() {
+            if let Ok(completion) = rx.try_recv() {
                 self.completion = completion;
                 helix_event::request_redraw();
             }
-            // The results this dispatch was meant to deliver were invalidated by a newer
-            // recalculation; that recalculation's own dispatch will deliver the new results.
-            Err(TryRecvError::Empty | TryRecvError::Disconnected) => (),
         }
     }
 
